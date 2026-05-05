@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Daily exec wrapper: runs an agent CLI as the sandbox OS user.
+#
+# Usage:
+#   agent-sandbox setup               — one-time setup (requires sudo)
+#   agent-sandbox allow <path>        — add a directory to the read allowlist
+#   agent-sandbox deny  <path>        — remove a directory from the read allowlist
+#   agent-sandbox status              — show sandbox configuration
+#   agent-sandbox <cli> [args...]     — run <cli> as the sandbox user in CWD
+set -euo pipefail
+
+# Resolve symlinks so the script works when invoked via a link in ~/.local/bin etc.
+_src="${BASH_SOURCE[0]}"
+while [[ -L "$_src" ]]; do
+    _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+    _src="$(readlink "$_src")"
+    [[ "$_src" != /* ]] && _src="${_dir}/${_src}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+LIB="${SCRIPT_DIR}/lib"
+# shellcheck source=lib/platform.sh
+source "${LIB}/platform.sh"
+# shellcheck source=lib/env.sh
+source "${LIB}/env.sh"
+# shellcheck source=lib/acl.sh
+source "${LIB}/acl.sh"
+# shellcheck source=lib/sandbox.sh
+source "${LIB}/sandbox.sh"
+
+_usage() {
+    cat >&2 <<'EOF'
+Usage:
+  agent-sandbox setup               run one-time setup (requires sudo)
+  agent-sandbox allow <path>        add path to read allowlist
+  agent-sandbox deny  <path>        remove path from read allowlist
+  agent-sandbox status              show sandbox configuration
+  agent-sandbox <cli> [args...]     run <cli> as sandbox user in CWD
+EOF
+    exit 1
+}
+
+_cmd_setup() {
+    exec "${SCRIPT_DIR}/setup.sh" "$@"
+}
+
+_cmd_allow() {
+    local path="${1:-}"
+    [[ -z "$path" ]] && { echo "Usage: agent-sandbox allow <path>" >&2; exit 1; }
+    local real_path
+    real_path="$(_canonicalize "$path")"
+    deny_check_path "$real_path" || exit 1
+    allowlist_add "$real_path"
+    acl_grant_read "$SANDBOX_USER" "$real_path"
+    echo "Allowed: ${real_path}"
+}
+
+_cmd_deny() {
+    local path="${1:-}"
+    [[ -z "$path" ]] && { echo "Usage: agent-sandbox deny <path>" >&2; exit 1; }
+    local real_path
+    real_path="$(_canonicalize "$path")"
+    allowlist_remove "$real_path"
+    acl_revoke_read "$SANDBOX_USER" "$real_path"
+    echo "Denied: ${real_path}"
+}
+
+_cmd_status() {
+    echo "Sandbox user : ${SANDBOX_USER}"
+    echo "Sandbox home : ${SANDBOX_HOME}"
+    echo ""
+    echo "Allowlist    : ${ALLOWLIST_FILE}"
+    local found=0
+    while IFS= read -r line; do
+        echo "  ${line}"
+        found=1
+    done < <(allowlist_read)
+    [[ "$found" -eq 0 ]] && echo "  (none)"
+    echo ""
+    echo "API keys     : ${API_KEYS_FILE}"
+    found=0
+    while IFS= read -r line; do
+        echo "  ${line}"
+        found=1
+    done < <(api_keys_read)
+    [[ "$found" -eq 0 ]] && echo "  (none)"
+}
+
+# Globals used by the EXIT trap so local vars don't escape scope.
+_cleanup_user=""
+_cleanup_workspace=""
+_cleanup() {
+    [[ -n "$_cleanup_workspace" ]] \
+        && acl_revoke_readwrite "$_cleanup_user" "$_cleanup_workspace"
+}
+
+_cmd_exec() {
+    local cli="$1"; shift
+    local cli_path
+    cli_path="$(command -v "$cli")" || {
+        echo "agent-sandbox: '${cli}' not found on PATH" >&2
+        exit 127
+    }
+
+    # Grant RW on the workspace; revoke on any exit (including signals via EXIT trap).
+    local workspace="$PWD"
+    acl_grant_readwrite "$SANDBOX_USER" "$workspace"
+    _cleanup_user="$SANDBOX_USER"
+    _cleanup_workspace="$workspace"
+    trap _cleanup EXIT
+
+    # Build the sandbox env: allowlist + API keys (bare names → silently skipped if unset).
+    local -a api_keys env_vars
+    readarray -t api_keys < <(api_keys_read)
+    readarray -t env_vars < <(env_passthrough "${api_keys[@]}")
+    env_vars+=("HOME=${SANDBOX_HOME}")
+
+    # No `--` here: BSD env (macOS) doesn't recognize it. cli_path is absolute
+    # (from `command -v`), so env can't confuse it for an env-var assignment.
+    sudo -u "$SANDBOX_USER" env -i "${env_vars[@]}" "$cli_path" "$@"
+}
+
+case "${1:-}" in
+    setup)          shift; _cmd_setup  "$@" ;;
+    allow)          shift; _cmd_allow  "${1:-}" ;;
+    deny)           shift; _cmd_deny   "${1:-}" ;;
+    status)                _cmd_status ;;
+    ""|-h|--help)          _usage ;;
+    *)                     _cmd_exec "$@" ;;
+esac
