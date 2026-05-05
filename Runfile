@@ -1,0 +1,18 @@
+# @desc Run all tests
+test() {
+    bats wrapper/tests/platform.bats wrapper/tests/env.bats wrapper/tests/acl.bats \
+         wrapper/tests/sandbox.bats wrapper/tests/agent-sandbox.bats
+}
+
+# @desc Run tests for a single lib file: platform | env | acl
+# @arg name: str
+test:one(name: str) bats "wrapper/tests/${name}.bats"
+
+# @desc Check bats is installed
+test:check() {
+    if ! command -v bats &>/dev/null; then
+        echo "bats not found — install with: brew install bats-core"
+        exit 1
+    fi
+    bats --version
+}
